@@ -1,5 +1,5 @@
 ARG NODE_VERSION=24
-ARG RUBY_VERSION=4.0.6
+ARG RUBY_VERSION=4.0.9
 
 # Front Build
 FROM node:$NODE_VERSION-alpine AS front_build
@@ -50,13 +50,24 @@ RUN apt-get update -y && \
   chmod a+r /etc/apt/keyrings/docker.asc && \
   echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null && \
   apt-get update && \
-  apt-get install nginx xz-utils git libpq-dev postgresql-17 postgresql-17-partman redis-server docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin -y && \
+  apt-get upgrade -y && \
+  apt-get install nginx xz-utils libpq-dev postgresql-17 postgresql-17-partman redis-server -y && \
+  apt-get install --no-install-recommends git docker-ce-cli -y && \
   apt-get remove apt-transport-https -y
 
 COPY ./docker/nginx.conf /etc/nginx/sites-enabled/default
 
 COPY --from=front_build /app/dist /app/front
 COPY --from=api_build /usr/local/bundle/ /usr/local/bundle
+
+# Ruby 4.0.x ships the vulnerable json 2.18.0 as a default gem (CVE-2026-33210).
+# The bundle provides a fixed json, so the default copy is removed.
+RUN rm -rf /usr/local/lib/ruby/[0-9]*/json.rb \
+  /usr/local/lib/ruby/[0-9]*/json \
+  /usr/local/lib/ruby/[0-9]*/*-linux*/json \
+  /usr/local/lib/ruby/gems/[0-9]*/gems/json-[0-9]* \
+  /usr/local/lib/ruby/gems/[0-9]*/specifications/default/json-[0-9]*.gemspec && \
+  ruby -e 'require "json"; JSON.parse("{}")'
 
 COPY ./front/.env.sh ./front/.env.sh
 COPY ./api ./api

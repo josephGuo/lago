@@ -31,28 +31,45 @@ type EnrichedEvent struct {
 	BillableMetric *BillableMetric `json:"-"`
 	Subscription   *Subscription   `json:"-"`
 
-	OrganizationID          string         `json:"organization_id"`
-	ExternalSubscriptionID  string         `json:"external_subscription_id"`
-	SubscriptionID          string         `json:"subscription_id"`
-	PlanID                  string         `json:"plan_id"`
-	TransactionID           string         `json:"transaction_id"`
-	Code                    string         `json:"code"`
-	AggregationType         string         `json:"aggregation_type"`
-	Properties              map[string]any `json:"properties"`
-	PreciseTotalAmountCents string         `json:"precise_total_amount_cents"`
-	Source                  string         `json:"source,omitempty"`
-	Value                   *string        `json:"value"`
-	Timestamp               float64        `json:"timestamp"`
-	TimestampStr            string         `json:"-"`
-	Time                    time.Time      `json:"-"`
+	OrganizationID          string            `json:"organization_id"`
+	ExternalSubscriptionID  string            `json:"external_subscription_id"`
+	SubscriptionID          string            `json:"subscription_id"`
+	PlanID                  string            `json:"plan_id"`
+	TransactionID           string            `json:"transaction_id"`
+	Code                    string            `json:"code"`
+	AggregationType         string            `json:"aggregation_type"`
+	Properties              map[string]any    `json:"properties"`
+	PreciseTotalAmountCents string            `json:"precise_total_amount_cents"`
+	Source                  string            `json:"source,omitempty"`
+	Value                   *string           `json:"value"`
+	Timestamp               float64           `json:"timestamp"`
+	TimestampStr            string            `json:"-"`
+	Time                    time.Time         `json:"-"`
+	AttributionLabels       map[string]string `json:"attribution_labels,omitempty"`
 }
 
-type FailedEvent struct {
-	Event               Event     `json:"event"`
+// DeadLetterEvent is what a pipeline sends to its dead letter topic, around the
+// raw event it failed to process.
+type DeadLetterEvent[E any] struct {
+	Event               E         `json:"event"`
 	InitialErrorMessage string    `json:"initial_error_message"`
 	ErrorMessage        string    `json:"error_message"`
 	ErrorCode           string    `json:"error_code"`
 	FailedAt            time.Time `json:"failed_at"`
+}
+
+type FailedEvent = DeadLetterEvent[Event]
+
+func (ev *Event) IngestedTime() time.Time {
+	return ev.IngestedAt.Time()
+}
+
+// AttributionValuesMessage reports to the API the account tree values carried by an enriched event.
+type AttributionValuesMessage struct {
+	OrganizationID    string            `json:"organization_id"`
+	SubscriptionID    string            `json:"subscription_id"`
+	AttributionLabels map[string]string `json:"attribution_labels"`
+	Timestamp         float64           `json:"timestamp"`
 }
 
 func (ev *Event) ToEnrichedEvent() utils.Result[*EnrichedEvent] {
@@ -81,6 +98,23 @@ func (ev *Event) ToEnrichedEvent() utils.Result[*EnrichedEvent] {
 	er.Time = timeResult.Value()
 
 	return utils.SuccessResult(er)
+}
+
+func (er *EnrichedEvent) GetSource() string {
+	return er.Source
+}
+
+func (er *EnrichedEvent) GetProperties() map[string]any {
+	return er.Properties
+}
+
+func (er *EnrichedEvent) SetBillableMetric(bm *BillableMetric) {
+	er.BillableMetric = bm
+	er.AggregationType = bm.AggregationType.String()
+}
+
+func (er *EnrichedEvent) SetValue(value *string) {
+	er.Value = value
 }
 
 func (ev *Event) NotAPIPostProcessed() bool {

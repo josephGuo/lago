@@ -22,6 +22,8 @@ type testProducerService struct {
 	inAdvanceProducer  *tests.MockMessageProducer
 	deadLetterProducer *tests.MockMessageProducer
 	producerService    *EventProducerService
+
+	attributionValuesProducer *tests.MockMessageProducer
 }
 
 func setupProducers() *testProducerService {
@@ -40,6 +42,8 @@ func setupProducers() *testProducerService {
 		inAdvanceProducer:  &inAdvanceProducer,
 		deadLetterProducer: &deadLetterProducer,
 		producerService:    producerService,
+
+		attributionValuesProducer: &tests.MockMessageProducer{},
 	}
 }
 
@@ -48,6 +52,8 @@ type DataStore interface {
 	SetBillableMetric(bm *models.BillableMetric)
 	SetSubscription(sub *models.Subscription)
 	SetCharge(charge *models.Charge)
+	SetUsageAttributionTypes(types ...*models.UsageAttributionType)
+	ExpectUsageAttributionTypesError()
 	ExpectSubscriptionNotFound()
 	ExpectSubscriptionError()
 	ExpectBillableMetricNotFound()
@@ -74,9 +80,13 @@ func (s *CacheDataStore) SetCharge(charge *models.Charge) {
 	require.True(s.t, result.Success())
 }
 
-func (s *CacheDataStore) ExpectSubscriptionNotFound()   {}
-func (s *CacheDataStore) ExpectSubscriptionError()      {}
-func (s *CacheDataStore) ExpectBillableMetricNotFound() {}
+// Usage attribution types are not cached: events processed with the cache get no labels.
+func (s *CacheDataStore) SetUsageAttributionTypes(types ...*models.UsageAttributionType) {}
+
+func (s *CacheDataStore) ExpectUsageAttributionTypesError() {}
+func (s *CacheDataStore) ExpectSubscriptionNotFound()       {}
+func (s *CacheDataStore) ExpectSubscriptionError()          {}
+func (s *CacheDataStore) ExpectBillableMetricNotFound()     {}
 
 // MockDataStore wraps SQL mock for test setup
 type MockDataStore struct {
@@ -85,10 +95,10 @@ type MockDataStore struct {
 }
 
 func (s *MockDataStore) SetBillableMetric(bm *models.BillableMetric) {
-	columns := []string{"id", "organization_id", "code", "aggregation_type", "recurring", "field_name", "expression", "created_at", "updated_at", "deleted_at"}
+	columns := []string{"id", "organization_id", "code", "aggregation_type", "recurring", "field_name", "expression", "created_at", "updated_at", "deleted_at", "has_usage_attribution_types"}
 	rows := sqlmock.NewRows(columns).
-		AddRow(bm.ID, bm.OrganizationID, bm.Code, bm.AggregationType, bm.Recurring, bm.FieldName, bm.Expression, bm.CreatedAt, bm.UpdatedAt, bm.DeletedAt)
-	s.mock.SQLMock.ExpectQuery("SELECT \\* FROM \"billable_metrics\".*").WillReturnRows(rows)
+		AddRow(bm.ID, bm.OrganizationID, bm.Code, bm.AggregationType, bm.Recurring, bm.FieldName, bm.Expression, bm.CreatedAt, bm.UpdatedAt, bm.DeletedAt, bm.HasUsageAttributionTypes)
+	s.mock.SQLMock.ExpectQuery(".* FROM \"billable_metrics\".*").WillReturnRows(rows)
 }
 
 func (s *MockDataStore) SetSubscription(sub *models.Subscription) {
@@ -106,6 +116,20 @@ func (s *MockDataStore) SetCharge(charge *models.Charge) {
 		rows.AddRow(charge.ID)
 	}
 	s.mock.SQLMock.ExpectQuery(".* FROM \"charges\".*").WillReturnRows(rows)
+}
+
+// SetUsageAttributionTypes registers the organization's usage attribution types lookup, that events
+// go through once their subscription is resolved, when their billable metric has HasUsageAttributionTypes.
+func (s *MockDataStore) SetUsageAttributionTypes(types ...*models.UsageAttributionType) {
+	rows := sqlmock.NewRows([]string{"code", "attribution_keys"})
+	for _, uat := range types {
+		rows.AddRow(uat.Code, uat.AttributionKeys)
+	}
+	s.mock.SQLMock.ExpectQuery(".* FROM \"usage_attribution_types\".*").WillReturnRows(rows)
+}
+
+func (s *MockDataStore) ExpectUsageAttributionTypesError() {
+	s.mock.SQLMock.ExpectQuery(".* FROM \"usage_attribution_types\".*").WillReturnError(gorm.ErrInvalidDB)
 }
 
 func (s *MockDataStore) ExpectSubscriptionNotFound() {
@@ -159,6 +183,7 @@ func setupProcessorTestEnv(t *testing.T, useCache bool) *ProcessorTestEnv {
 		NewEventEnrichmentService(apiStore, memCache),
 		testProducers.producerService,
 		flagger,
+		NewAttributionValuesService(testProducers.attributionValuesProducer),
 	)
 
 	return &ProcessorTestEnv{
@@ -256,6 +281,66 @@ func TestProcessEvent(t *testing.T) {
 			assert.Equal(t, 1, testEnv.Producers.enrichedProducer.ExecutionCount)
 			// The event was already post processed on API, no pay in advance production
 			assert.Equal(t, 0, testEnv.Producers.inAdvanceProducer.ExecutionCount)
+		})
+
+		t.Run("When event carries attribution labels", func(t *testing.T) {
+			testEnv := setupProcessorTestEnv(t, mode.useCache)
+			defer testEnv.Cleanup()
+
+			orgID := "1a901a90-1a90-1a90-1a90-1a901a901a90"
+
+			event := models.Event{
+				OrganizationID:         orgID,
+				ExternalSubscriptionID: "sub_id",
+				Code:                   "api_calls",
+				Timestamp:              1741007009,
+				Source:                 models.HTTP_RUBY,
+				Properties:             map[string]any{"api_requests": "12.0", "user_id": "alice"},
+				SourceMetadata:         &models.SourceMetadata{ApiPostProcess: true},
+			}
+
+			testEnv.DataStore.SetBillableMetric(&models.BillableMetric{
+				ID:                       "bm123",
+				OrganizationID:           orgID,
+				Code:                     event.Code,
+				AggregationType:          models.AggregationTypeSum,
+				FieldName:                "api_requests",
+				HasUsageAttributionTypes: true,
+				CreatedAt:                utils.NowNullTime(),
+				UpdatedAt:                utils.NowNullTime(),
+			})
+			testEnv.DataStore.SetSubscription(&models.Subscription{
+				ID:             "sub123",
+				OrganizationID: &orgID,
+				ExternalID:     event.ExternalSubscriptionID,
+				PlanID:         "plan123",
+				StartedAt:      utils.NewNullTime(time.Unix(1700000000, 0)),
+			})
+			testEnv.DataStore.SetUsageAttributionTypes(
+				&models.UsageAttributionType{Code: "user", AttributionKeys: utils.StringArray{"user_id"}},
+			)
+
+			result := testEnv.EventProcessor.processEvent(context.Background(), &event)
+			require.True(t, result.Success())
+
+			assert.Equal(t, 1, testEnv.Producers.enrichedProducer.ExecutionCount)
+
+			// The in memory cache stamps no labels, so nothing is reported.
+			if mode.useCache {
+				assert.Equal(t, 0, testEnv.Producers.attributionValuesProducer.Executions())
+				return
+			}
+
+			// The values are reported from a goroutine, outside the event's errgroup.
+			assert.Eventually(t, func() bool {
+				return testEnv.Producers.attributionValuesProducer.Executions() == 1
+			}, time.Second, 10*time.Millisecond)
+			assert.Equal(t, []byte(orgID+"-sub123"), testEnv.Producers.attributionValuesProducer.Key)
+			assert.JSONEq(
+				t,
+				`{"organization_id":"`+orgID+`","subscription_id":"sub123","attribution_labels":{"user":"alice"},"timestamp":1741007009}`,
+				string(testEnv.Producers.attributionValuesProducer.Value),
+			)
 		})
 
 		t.Run("When event source is not post process on API when timestamp is invalid", func(t *testing.T) {
